@@ -67,3 +67,22 @@ target_link_libraries(teste_uart pico_stdlib hardware_uart)
 pico_enable_stdio_usb(teste_uart 1)
 pico_enable_stdio_uart(teste_uart 0)
 pico_add_extra_outputs(teste_uart)
+
+# ========================================
+# AP3: PWM + Timer/Timer Interrupt + Interrupcao Externa
+# (ADC e UART da AP2 como entradas de apoio)
+# ========================================
+add_executable(teste_ap3 teste_ap3.c)
+pico_set_program_name(teste_ap3 "teste_ap3")
+pico_set_program_version(teste_ap3 "0.1")
+target_link_libraries(teste_ap3
+    pico_stdlib
+    hardware_pwm
+    hardware_timer
+    hardware_clocks
+    hardware_adc
+    hardware_uart
+)
+pico_enable_stdio_usb(teste_ap3 1)
+pico_enable_stdio_uart(teste_ap3 0)
+pico_add_extra_outputs(teste_ap3)
