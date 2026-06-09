@@ -6,7 +6,7 @@
  * Atuadores (todos por PWM):
  *   - Aquecedor (LED vermelho)   -> GP15  slice 7 B  ~1 kHz
  *   - Ventilador (cooler 12V)    -> GP16  slice 0 A  ~25 kHz  (gate do IRLZ44N)
- *   - Buzzer de alarme (passivo) -> GP12  slice 6 A  ~2 kHz
+ *   - Buzzer de alarme (ATIVO)   -> GP12  GPIO digital on/off (oscilador interno)
  *   - Umidificador (LED azul)    -> GP11  slice 5 B  ~1 kHz
  *
  * Entradas digitais (interrupcao externa, borda de descida, pull-up):
@@ -41,7 +41,7 @@
 // ==========================================================================
 #define PINO_AQUECEDOR   15   // PWM aquecedor (LED vermelho)
 #define PINO_VENTILADOR  16   // PWM ventilador (MOSFET IRLZ44N)
-#define PINO_BUZZER      12   // PWM buzzer (alarme)
+#define PINO_BUZZER      12   // buzzer ATIVO (alarme) - GPIO digital on/off
 #define PINO_UMIDIFIC    11   // PWM umidificador (LED azul)
 
 #define PINO_BTN_POWER   14   // botao POWER (liga/desliga)
@@ -64,11 +64,9 @@
 // ==========================================================================
 #define FREQ_AQUECEDOR   1000     // ~1 kHz  (LED sem cintilacao visivel)
 #define FREQ_VENTILADOR  25000    // ~25 kHz (acima do audivel, sem zumbido)
-#define FREQ_BUZZER      2000     // ~2 kHz  (tom audivel no alarme)
 #define FREQ_UMIDIFIC    1000     // ~1 kHz  (LED)
 
 #define PWM_CLKDIV       4.0f     // divisor comum no calculo do wrap
-#define DUTY_BUZZER_ON   50       // duty do buzzer quando o alarme dispara
 
 // ==========================================================================
 // ADC
@@ -154,7 +152,7 @@ static void atuadores_off(void) {
     pwm_set_duty(PINO_AQUECEDOR, 0);
     pwm_set_duty(PINO_VENTILADOR, 0);
     pwm_set_duty(PINO_UMIDIFIC, 0);
-    pwm_set_duty(PINO_BUZZER, 0);
+    gpio_put(PINO_BUZZER, 0);
 }
 
 // ==========================================================================
@@ -253,8 +251,14 @@ static void ler_uart_nao_bloqueante(void) {
 static void init_pwm(void) {
     pwm_init_pino(PINO_AQUECEDOR,  FREQ_AQUECEDOR);
     pwm_init_pino(PINO_VENTILADOR, FREQ_VENTILADOR);
-    pwm_init_pino(PINO_BUZZER,     FREQ_BUZZER);
     pwm_init_pino(PINO_UMIDIFIC,   FREQ_UMIDIFIC);
+}
+
+// Buzzer ATIVO: oscilador interno proprio, acionado por GPIO digital on/off.
+static void init_buzzer(void) {
+    gpio_init(PINO_BUZZER);
+    gpio_set_dir(PINO_BUZZER, GPIO_OUT);
+    gpio_put(PINO_BUZZER, 0);   // alarme desligado
 }
 
 static void init_botoes(void) {
@@ -331,7 +335,7 @@ static void ciclo_controle(void) {
     pwm_set_duty(PINO_AQUECEDOR, duty_aq);
     pwm_set_duty(PINO_VENTILADOR, duty_vt);
     pwm_set_duty(PINO_UMIDIFIC, duty_um);
-    pwm_set_duty(PINO_BUZZER, alarme ? DUTY_BUZZER_ON : 0);
+    gpio_put(PINO_BUZZER, alarme ? 1 : 0);
 
     // Status pela UART0 fisica.
     char status[120];
@@ -352,6 +356,7 @@ int main(void) {
 
     init_heartbeat();
     init_pwm();
+    init_buzzer();
     init_adc();
     init_uart();
     init_botoes();
