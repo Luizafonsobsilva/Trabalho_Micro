@@ -136,8 +136,8 @@ static void pwm_init_pino(uint gpio, uint freq) {
     gpio_set_function(gpio, GPIO_FUNC_PWM);
     uint slice = pwm_gpio_to_slice_num(gpio);
 
-    uint32_t clk_sys = clock_get_hz(clk_sys);
-    uint32_t wrap = (uint32_t)((float)clk_sys / (PWM_CLKDIV * (float)freq)) - 1;
+    uint32_t f_clk = clock_get_hz(clk_sys);   // enum clk_sys (nao sombrear!)
+    uint32_t wrap = (uint32_t)((float)f_clk / (PWM_CLKDIV * (float)freq)) - 1;
 
     pwm_config cfg = pwm_get_default_config();
     pwm_config_set_clkdiv(&cfg, PWM_CLKDIV);
@@ -212,62 +212,27 @@ static float ler_umidade(void) {
 }
 
 // ==========================================================================
-// UART - parser (reaproveitado da AP2, estendido com SET UMID)
-// So aceita comandos no modo MANUAL.
+// Comandos: um unico parser atende a UART fisica E a USB-CDC.
+// As respostas saem nos DOIS canais (responder()).
+//
+// Operacao:
+//   MODO AUTO | MODO MAN   -> troca o modo (mesmo efeito do botao GP13)
+//   SET TEMP <v>           -> setpoint de temperatura (so no modo MANUAL)
+//   SET UMID <v>           -> setpoint de umidade     (so no modo MANUAL)
+// Teste de atuadores (precisa de TEST ON; suspende o controle automatico):
+//   TEST ON | TEST OFF
+//   AQ <0-100> | VT <0-100> | UM <0-100> | BZ <0|1> | SWEEP
 // ==========================================================================
 static void uart_envia(const char *s) {
     uart_write_blocking(UART_ID, (const uint8_t *)s, strlen(s));
 }
 
-static void processar_comando(const char *cmd) {
-    if (modo != MODO_MANUAL) {
-        uart_envia("ERRO COMANDOS SO NO MODO MANUAL\r\n");
-        return;
-    }
-
-    char resp[64];
-    if (strncmp(cmd, "SET TEMP ", 9) == 0) {
-        setpoint_temp = strtof(cmd + 9, NULL);
-        snprintf(resp, sizeof(resp), "OK SETPOINT TEMP = %.1f C\r\n", setpoint_temp);
-        uart_envia(resp);
-    } else if (strncmp(cmd, "SET UMID ", 9) == 0) {
-        setpoint_umid = strtof(cmd + 9, NULL);
-        snprintf(resp, sizeof(resp), "OK SETPOINT UMID = %.1f %%\r\n", setpoint_umid);
-        uart_envia(resp);
-    } else {
-        uart_envia("ERRO COMANDO DESCONHECIDO\r\n");
-    }
+// Resposta de comando: ecoa nos dois canais (UART fisica + USB-CDC).
+static void responder(const char *s) {
+    uart_envia(s);
+    printf("%s", s);
 }
 
-static void ler_uart_nao_bloqueante(void) {
-    while (uart_is_readable(UART_ID)) {
-        char c = uart_getc(UART_ID);
-        if (c == '\n' || c == '\r') {
-            if (idx_rx > 0) {
-                buffer_rx[idx_rx] = '\0';
-                processar_comando(buffer_rx);
-                idx_rx = 0;
-            }
-        } else if (idx_rx < (TAM_BUFFER - 1)) {
-            buffer_rx[idx_rx++] = c;
-        } else {
-            idx_rx = 0;   // overflow sem terminador: descarta
-        }
-    }
-}
-
-// ==========================================================================
-// [DIAGNOSTICO] Modo de teste manual dos atuadores (via USB-CDC)
-// Permite acionar cada atuador isoladamente, sem depender dos sensores nem
-// da UART fisica. Comandos (digite no Serial Monitor USB do Pico + Enter):
-//   TEST ON    -> entra no modo de teste (suspende o controle automatico)
-//   TEST OFF   -> sai do modo de teste
-//   AQ <0-100> -> aquecedor  (LED vermelho, GP15)
-//   VT <0-100> -> ventilador (GP16)
-//   UM <0-100> -> umidificador (LED azul, GP11)
-//   BZ <0|1>   -> buzzer (GP12)
-//   SWEEP      -> varre todos os atuadores em sequencia (0->100->0) + beeps
-// ==========================================================================
 static void sweep_atuadores(void) {
     struct { uint gpio; const char *nome; } a[] = {
         { PINO_AQUECEDOR,  "aquecedor   (GP15, vermelho)" },
@@ -288,34 +253,102 @@ static void sweep_atuadores(void) {
     printf("[TEST] SWEEP fim\n");
 }
 
-static void processar_comando_usb(const char *cmd) {
+static void processar_comando(const char *cmd) {
     int v;
+    char resp[80];
+
+    // ---- modo de operacao (mesmo efeito do botao MODO/GP13) ----
+    if (strcmp(cmd, "MODO AUTO") == 0) {
+        modo = MODO_AUTOMATICO;
+        responder("OK MODO = AUTO\r\n");
+        return;
+    }
+    if (strcmp(cmd, "MODO MAN") == 0 || strcmp(cmd, "MODO MANUAL") == 0) {
+        modo = MODO_MANUAL;
+        responder("OK MODO = MANUAL\r\n");
+        return;
+    }
+
+    // ---- setpoints: so valem no modo MANUAL ----
+    if (strncmp(cmd, "SET TEMP ", 9) == 0) {
+        if (modo != MODO_MANUAL) { responder("ERRO SET SO NO MODO MANUAL\r\n"); return; }
+        setpoint_temp = strtof(cmd + 9, NULL);
+        snprintf(resp, sizeof(resp), "OK SETPOINT TEMP = %.1f C\r\n", setpoint_temp);
+        responder(resp);
+        return;
+    }
+    if (strncmp(cmd, "SET UMID ", 9) == 0) {
+        if (modo != MODO_MANUAL) { responder("ERRO SET SO NO MODO MANUAL\r\n"); return; }
+        setpoint_umid = strtof(cmd + 9, NULL);
+        snprintf(resp, sizeof(resp), "OK SETPOINT UMID = %.1f %%\r\n", setpoint_umid);
+        responder(resp);
+        return;
+    }
+
+    // ---- teste de atuadores: precisa de TEST ON ----
     if (strcmp(cmd, "TEST ON") == 0) {
         modo_teste = true;
         atuadores_off();
-        printf("[TEST] modo de teste LIGADO (controle automatico suspenso)\n");
-    } else if (strcmp(cmd, "TEST OFF") == 0) {
+        responder("OK TESTE ON (controle automatico suspenso)\r\n");
+        return;
+    }
+    if (strcmp(cmd, "TEST OFF") == 0) {
         modo_teste = false;
         atuadores_off();
-        printf("[TEST] modo de teste DESLIGADO\n");
-    } else if (!modo_teste) {
-        printf("[TEST] envie 'TEST ON' antes de testar atuadores\n");
-    } else if (strcmp(cmd, "SWEEP") == 0) {
+        responder("OK TESTE OFF\r\n");
+        return;
+    }
+    if (strcmp(cmd, "SWEEP") == 0) {
+        if (!modo_teste) { responder("ERRO ENVIE TEST ON ANTES\r\n"); return; }
         sweep_atuadores();
-    } else if (sscanf(cmd, "AQ %d", &v) == 1) {
+        return;
+    }
+    if (sscanf(cmd, "AQ %d", &v) == 1) {
+        if (!modo_teste) { responder("ERRO ENVIE TEST ON ANTES\r\n"); return; }
         pwm_set_duty(PINO_AQUECEDOR, v);
-        printf("[TEST] aquecedor (GP15) = %d%%\n", v);
-    } else if (sscanf(cmd, "VT %d", &v) == 1) {
+        snprintf(resp, sizeof(resp), "OK AQ = %d%%\r\n", v);
+        responder(resp);
+        return;
+    }
+    if (sscanf(cmd, "VT %d", &v) == 1) {
+        if (!modo_teste) { responder("ERRO ENVIE TEST ON ANTES\r\n"); return; }
         pwm_set_duty(PINO_VENTILADOR, v);
-        printf("[TEST] ventilador (GP16) = %d%%\n", v);
-    } else if (sscanf(cmd, "UM %d", &v) == 1) {
+        snprintf(resp, sizeof(resp), "OK VT = %d%%\r\n", v);
+        responder(resp);
+        return;
+    }
+    if (sscanf(cmd, "UM %d", &v) == 1) {
+        if (!modo_teste) { responder("ERRO ENVIE TEST ON ANTES\r\n"); return; }
         pwm_set_duty(PINO_UMIDIFIC, v);
-        printf("[TEST] umidificador (GP11) = %d%%\n", v);
-    } else if (sscanf(cmd, "BZ %d", &v) == 1) {
+        snprintf(resp, sizeof(resp), "OK UM = %d%%\r\n", v);
+        responder(resp);
+        return;
+    }
+    if (sscanf(cmd, "BZ %d", &v) == 1) {
+        if (!modo_teste) { responder("ERRO ENVIE TEST ON ANTES\r\n"); return; }
         gpio_put(PINO_BUZZER, v ? 1 : 0);
-        printf("[TEST] buzzer (GP12) = %d\n", v ? 1 : 0);
-    } else {
-        printf("[TEST] comando desconhecido: '%s'\n", cmd);
+        snprintf(resp, sizeof(resp), "OK BZ = %d\r\n", v ? 1 : 0);
+        responder(resp);
+        return;
+    }
+
+    responder("ERRO COMANDO DESCONHECIDO\r\n");
+}
+
+static void ler_uart_nao_bloqueante(void) {
+    while (uart_is_readable(UART_ID)) {
+        char c = uart_getc(UART_ID);
+        if (c == '\n' || c == '\r') {
+            if (idx_rx > 0) {
+                buffer_rx[idx_rx] = '\0';
+                processar_comando(buffer_rx);
+                idx_rx = 0;
+            }
+        } else if (idx_rx < (TAM_BUFFER - 1)) {
+            buffer_rx[idx_rx++] = c;
+        } else {
+            idx_rx = 0;   // overflow sem terminador: descarta
+        }
     }
 }
 
@@ -325,7 +358,7 @@ static void ler_usb_nao_bloqueante(void) {
         if (c == '\n' || c == '\r') {
             if (idx_usb > 0) {
                 buffer_usb[idx_usb] = '\0';
-                processar_comando_usb(buffer_usb);
+                processar_comando(buffer_usb);
                 idx_usb = 0;
             }
         } else if (idx_usb < (TAM_BUFFER - 1)) {
@@ -479,11 +512,13 @@ int main(void) {
     uart_envia("=== AP3 Teste integrado - BRUCUTU ===\r\n");
     uart_envia("POWER=GP14  MODO=GP13  (AUTO/MANUAL)\r\n");
 
-    // Banner/ajuda na USB-CDC (debug).
+    // Banner/ajuda na USB-CDC (debug). Os mesmos comandos valem pela UART.
     printf("\n=== AP3 - BRUCUTU =========================================\n");
     printf("Heartbeat (LED onboard): %s\n", hb_ok ? "ok" : "FALHOU cyw43");
-    printf("POWER=GP14 (liga/desliga)   MODO=GP13 (AUTO/MANUAL)\n");
-    printf("Teste manual de atuadores pela USB:\n");
+    printf("Botoes: POWER=GP14 (liga/desliga)  MODO=GP13 (AUTO/MANUAL)\n");
+    printf("Comandos (UART fisica OU USB):\n");
+    printf("  MODO AUTO | MODO MAN\n");
+    printf("  SET TEMP <v> | SET UMID <v>   (so no modo MANUAL)\n");
     printf("  TEST ON | TEST OFF | SWEEP\n");
     printf("  AQ <0-100> | VT <0-100> | UM <0-100> | BZ <0|1>\n");
     printf("===========================================================\n\n");
