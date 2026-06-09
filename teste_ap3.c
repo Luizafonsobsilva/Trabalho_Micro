@@ -30,6 +30,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "pico/stdlib.h"
+#include "pico/cyw43_arch.h"   // LED onboard do Pico 2 W (via chip CYW43)
 #include "hardware/pwm.h"
 #include "hardware/timer.h"
 #include "hardware/clocks.h"
@@ -47,7 +48,8 @@
 #define PINO_BTN_POWER   14   // botao POWER (liga/desliga)
 #define PINO_BTN_MODO    13   // botao MODO  (AUTO <-> MANUAL)
 
-#define PINO_HEARTBEAT   25   // LED status onboard
+// Heartbeat: no Pico 2 W o LED onboard NAO e um GPIO comum (o GP25 e o
+// chip-select do CYW43). Usamos CYW43_WL_GPIO_LED_PIN via cyw43_arch.
 
 #define PINO_LM35        26   // ADC0
 #define PINO_UMIDADE     27   // ADC1
@@ -102,6 +104,11 @@ static volatile bool    sistema_ligado   = false;
 static volatile modo_t  modo             = MODO_AUTOMATICO;
 static volatile bool    tick_amostragem  = false;
 
+// [DIAGNOSTICO] modo de teste manual dos atuadores (via USB-CDC).
+// Quando ligado, o ciclo de controle automatico fica suspenso e os
+// atuadores so respondem aos comandos de teste.
+static volatile bool modo_teste = false;
+
 // Setpoints: no modo AUTO valem os padroes; no MANUAL vem da UART.
 static float setpoint_temp = SETPOINT_TEMP_PADRAO;
 static float setpoint_umid = SETPOINT_UMID_PADRAO;
@@ -110,6 +117,10 @@ static float setpoint_umid = SETPOINT_UMID_PADRAO;
 #define TAM_BUFFER 64
 static char buffer_rx[TAM_BUFFER];
 static int  idx_rx = 0;
+
+// [DIAGNOSTICO] buffer de comandos de teste vindos da USB-CDC.
+static char buffer_usb[TAM_BUFFER];
+static int  idx_usb = 0;
 
 // Debounce: ultimo instante aceito de cada botao.
 static volatile uint64_t ultimo_power_us = 0;
@@ -160,9 +171,9 @@ static void atuadores_off(void) {
 // ==========================================================================
 static bool cb_timer_amostragem(repeating_timer_t *t) {
     (void)t;
-    tick_amostragem = true;
-    gpio_xor_mask(1u << PINO_HEARTBEAT);   // toggle do LED status
-    return true;   // mantem o timer repetindo
+    tick_amostragem = true;   // o pisca do LED e o controle sao feitos no main
+    return true;              // mantem o timer repetindo
+    // OBS: nada de cyw43_arch_gpio_put aqui - faz SPI lenta/bloqueante.
 }
 
 // ==========================================================================
@@ -246,6 +257,87 @@ static void ler_uart_nao_bloqueante(void) {
 }
 
 // ==========================================================================
+// [DIAGNOSTICO] Modo de teste manual dos atuadores (via USB-CDC)
+// Permite acionar cada atuador isoladamente, sem depender dos sensores nem
+// da UART fisica. Comandos (digite no Serial Monitor USB do Pico + Enter):
+//   TEST ON    -> entra no modo de teste (suspende o controle automatico)
+//   TEST OFF   -> sai do modo de teste
+//   AQ <0-100> -> aquecedor  (LED vermelho, GP15)
+//   VT <0-100> -> ventilador (GP16)
+//   UM <0-100> -> umidificador (LED azul, GP11)
+//   BZ <0|1>   -> buzzer (GP12)
+//   SWEEP      -> varre todos os atuadores em sequencia (0->100->0) + beeps
+// ==========================================================================
+static void sweep_atuadores(void) {
+    struct { uint gpio; const char *nome; } a[] = {
+        { PINO_AQUECEDOR,  "aquecedor   (GP15, vermelho)" },
+        { PINO_VENTILADOR, "ventilador  (GP16)" },
+        { PINO_UMIDIFIC,   "umidificador(GP11, azul)" },
+    };
+    for (int i = 0; i < 3; i++) {
+        printf("[TEST] SWEEP %s : 0 -> 100\n", a[i].nome);
+        for (int d = 0; d <= 100; d += 10) { pwm_set_duty(a[i].gpio, d); sleep_ms(80); }
+        for (int d = 100; d >= 0; d -= 10) { pwm_set_duty(a[i].gpio, d); sleep_ms(80); }
+        pwm_set_duty(a[i].gpio, 0);
+    }
+    printf("[TEST] SWEEP buzzer (GP12): 3 beeps\n");
+    for (int i = 0; i < 3; i++) {
+        gpio_put(PINO_BUZZER, 1); sleep_ms(150);
+        gpio_put(PINO_BUZZER, 0); sleep_ms(150);
+    }
+    printf("[TEST] SWEEP fim\n");
+}
+
+static void processar_comando_usb(const char *cmd) {
+    int v;
+    if (strcmp(cmd, "TEST ON") == 0) {
+        modo_teste = true;
+        atuadores_off();
+        printf("[TEST] modo de teste LIGADO (controle automatico suspenso)\n");
+    } else if (strcmp(cmd, "TEST OFF") == 0) {
+        modo_teste = false;
+        atuadores_off();
+        printf("[TEST] modo de teste DESLIGADO\n");
+    } else if (!modo_teste) {
+        printf("[TEST] envie 'TEST ON' antes de testar atuadores\n");
+    } else if (strcmp(cmd, "SWEEP") == 0) {
+        sweep_atuadores();
+    } else if (sscanf(cmd, "AQ %d", &v) == 1) {
+        pwm_set_duty(PINO_AQUECEDOR, v);
+        printf("[TEST] aquecedor (GP15) = %d%%\n", v);
+    } else if (sscanf(cmd, "VT %d", &v) == 1) {
+        pwm_set_duty(PINO_VENTILADOR, v);
+        printf("[TEST] ventilador (GP16) = %d%%\n", v);
+    } else if (sscanf(cmd, "UM %d", &v) == 1) {
+        pwm_set_duty(PINO_UMIDIFIC, v);
+        printf("[TEST] umidificador (GP11) = %d%%\n", v);
+    } else if (sscanf(cmd, "BZ %d", &v) == 1) {
+        gpio_put(PINO_BUZZER, v ? 1 : 0);
+        printf("[TEST] buzzer (GP12) = %d\n", v ? 1 : 0);
+    } else {
+        printf("[TEST] comando desconhecido: '%s'\n", cmd);
+    }
+}
+
+static void ler_usb_nao_bloqueante(void) {
+    int c = getchar_timeout_us(0);
+    while (c != PICO_ERROR_TIMEOUT) {
+        if (c == '\n' || c == '\r') {
+            if (idx_usb > 0) {
+                buffer_usb[idx_usb] = '\0';
+                processar_comando_usb(buffer_usb);
+                idx_usb = 0;
+            }
+        } else if (idx_usb < (TAM_BUFFER - 1)) {
+            buffer_usb[idx_usb++] = (char)c;
+        } else {
+            idx_usb = 0;
+        }
+        c = getchar_timeout_us(0);
+    }
+}
+
+// ==========================================================================
 // Inicializacao
 // ==========================================================================
 static void init_pwm(void) {
@@ -276,10 +368,19 @@ static void init_botoes(void) {
     gpio_set_irq_enabled(PINO_BTN_MODO, GPIO_IRQ_EDGE_FALL, true);
 }
 
-static void init_heartbeat(void) {
-    gpio_init(PINO_HEARTBEAT);
-    gpio_set_dir(PINO_HEARTBEAT, GPIO_OUT);
-    gpio_put(PINO_HEARTBEAT, 0);
+// LED de status onboard do Pico 2 W (controlado pelo chip CYW43).
+// Retorna true se o chip inicializou; se falhar, o resto do firmware segue
+// funcionando, so sem o LED de heartbeat.
+static bool init_heartbeat(void) {
+    if (cyw43_arch_init() != 0) {
+        return false;
+    }
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);   // comeca apagado
+    return true;
+}
+
+static void heartbeat_set(bool ligado) {
+    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, ligado);
 }
 
 static void init_adc(void) {
@@ -337,15 +438,23 @@ static void ciclo_controle(void) {
     pwm_set_duty(PINO_UMIDIFIC, duty_um);
     gpio_put(PINO_BUZZER, alarme ? 1 : 0);
 
-    // Status pela UART0 fisica.
+    const char *nome_modo = (modo == MODO_AUTOMATICO) ? "AUTO" : "MAN";
+
+    // Status pela UART0 fisica (formato do protocolo - nao alterar).
     char status[120];
     snprintf(status, sizeof(status),
              "STATUS MODO=%s T=%.1f/%.1fC U=%.1f/%.1f%% "
              "AQ=%d VT=%d UM=%d%s\r\n",
-             (modo == MODO_AUTOMATICO) ? "AUTO" : "MAN",
-             temp, setpoint_temp, umid, setpoint_umid,
+             nome_modo, temp, setpoint_temp, umid, setpoint_umid,
              duty_aq, duty_vt, duty_um, alarme ? " ALARME" : "");
     uart_envia(status);
+
+    // Versao legivel pela USB-CDC (so debug).
+    printf("[%-4s] Temp %5.1f/%-4.1f C | Umid %5.1f/%-4.1f %% | "
+           "Aquec %3d%%  Vent %3d%%  Umid %3d%%%s\n",
+           nome_modo, temp, setpoint_temp, umid, setpoint_umid,
+           duty_aq, duty_vt, duty_um,
+           alarme ? "  *** ALARME ***" : "");
 }
 
 // ==========================================================================
@@ -354,7 +463,7 @@ static void ciclo_controle(void) {
 int main(void) {
     stdio_init_all();   // USB-CDC so para debug
 
-    init_heartbeat();
+    bool hb_ok = init_heartbeat();
     init_pwm();
     init_buzzer();
     init_adc();
@@ -370,16 +479,36 @@ int main(void) {
     uart_envia("=== AP3 Teste integrado - BRUCUTU ===\r\n");
     uart_envia("POWER=GP14  MODO=GP13  (AUTO/MANUAL)\r\n");
 
+    // Banner/ajuda na USB-CDC (debug).
+    printf("\n=== AP3 - BRUCUTU =========================================\n");
+    printf("Heartbeat (LED onboard): %s\n", hb_ok ? "ok" : "FALHOU cyw43");
+    printf("POWER=GP14 (liga/desliga)   MODO=GP13 (AUTO/MANUAL)\n");
+    printf("Teste manual de atuadores pela USB:\n");
+    printf("  TEST ON | TEST OFF | SWEEP\n");
+    printf("  AQ <0-100> | VT <0-100> | UM <0-100> | BZ <0|1>\n");
+    printf("===========================================================\n\n");
+
     bool estava_ligado = false;
 
     while (true) {
         // Comandos da UART tratados sempre (nao-bloqueante).
         ler_uart_nao_bloqueante();
+        // Comandos de teste pela USB.
+        ler_usb_nao_bloqueante();
 
         if (tick_amostragem) {
             tick_amostragem = false;
 
-            if (sistema_ligado) {
+            // Heartbeat: toggle do LED onboard a cada tick (250 ms).
+            if (hb_ok) {
+                static bool hb = false;
+                hb = !hb;
+                heartbeat_set(hb);
+            }
+
+            if (modo_teste) {
+                // Atuadores controlados manualmente pelos comandos de teste.
+            } else if (sistema_ligado) {
                 ciclo_controle();
                 estava_ligado = true;
             } else {
@@ -387,6 +516,7 @@ int main(void) {
                 if (estava_ligado) {
                     atuadores_off();
                     uart_envia("STATUS SISTEMA DESLIGADO\r\n");
+                    printf("[OFF] sistema desligado\n");
                     estava_ligado = false;
                 }
             }

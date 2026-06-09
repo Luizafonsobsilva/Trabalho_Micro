@@ -24,33 +24,41 @@ set(PICO_PLATFORM rp2350-riscv)
 set(PICO_BOARD pico2_w CACHE STRING "Board type")
 
 include(pico_sdk_import.cmake)
-project(ap2_testes C CXX ASM)
+project(teste_ap3 C CXX ASM)
 pico_sdk_init()
 
 # ========================================
-# ALVO PRINCIPAL: teste_integrado
-# ADC + UART funcionando juntos
+# ALVO PRINCIPAL (AP3): teste_ap3
+# PWM + Timer/Timer Interrupt + Interrupcao Externa
+# (ADC e UART da AP2 como entradas de apoio)
 # ========================================
-add_executable(teste_integrado
-    teste_integrado.c
-)
-pico_set_program_name(teste_integrado "teste_integrado")
-pico_set_program_version(teste_integrado "0.1")
-
-target_link_libraries(teste_integrado
+add_executable(teste_ap3 teste_ap3.c)
+pico_set_program_name(teste_ap3 "teste_ap3")
+pico_set_program_version(teste_ap3 "0.1")
+target_link_libraries(teste_ap3
     pico_stdlib
+    pico_cyw43_arch_none   # LED onboard do Pico 2 W (via chip CYW43)
+    hardware_pwm
+    hardware_timer
+    hardware_clocks
     hardware_adc
     hardware_uart
 )
+pico_enable_stdio_usb(teste_ap3 1)
+pico_enable_stdio_uart(teste_ap3 0)
+pico_add_extra_outputs(teste_ap3)
 
+# ========================================
+# ALVOS DE APOIO (AP2 / debug)
+# Testes isolados de modulos, usados como fallback
+# ========================================
+add_executable(teste_integrado teste_integrado.c)
+pico_set_program_name(teste_integrado "teste_integrado")
+pico_set_program_version(teste_integrado "0.1")
+target_link_libraries(teste_integrado pico_stdlib hardware_adc hardware_uart)
 pico_enable_stdio_usb(teste_integrado 1)
 pico_enable_stdio_uart(teste_integrado 0)
 pico_add_extra_outputs(teste_integrado)
-
-# ========================================
-# ALVOS ISOLADOS (fallback para debug)
-# Descomente se precisar testar um modulo sozinho
-# ========================================
 
 add_executable(teste_adc teste_adc.c)
 pico_set_program_name(teste_adc "teste_adc")
@@ -67,22 +75,3 @@ target_link_libraries(teste_uart pico_stdlib hardware_uart)
 pico_enable_stdio_usb(teste_uart 1)
 pico_enable_stdio_uart(teste_uart 0)
 pico_add_extra_outputs(teste_uart)
-
-# ========================================
-# AP3: PWM + Timer/Timer Interrupt + Interrupcao Externa
-# (ADC e UART da AP2 como entradas de apoio)
-# ========================================
-add_executable(teste_ap3 teste_ap3.c)
-pico_set_program_name(teste_ap3 "teste_ap3")
-pico_set_program_version(teste_ap3 "0.1")
-target_link_libraries(teste_ap3
-    pico_stdlib
-    hardware_pwm
-    hardware_timer
-    hardware_clocks
-    hardware_adc
-    hardware_uart
-)
-pico_enable_stdio_usb(teste_ap3 1)
-pico_enable_stdio_uart(teste_ap3 0)
-pico_add_extra_outputs(teste_ap3)
