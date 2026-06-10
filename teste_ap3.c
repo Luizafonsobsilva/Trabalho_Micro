@@ -166,6 +166,16 @@ static void atuadores_off(void) {
     gpio_put(PINO_BUZZER, 0);
 }
 
+// Intertravamento de seguranca: aquecedor e ventilador nunca ambos no maximo.
+// Se os dois passarem do limiar, zera o aquecedor e retorna true (alarme).
+static bool aplicar_interlock(int *duty_aq, int *duty_vt) {
+    if (*duty_aq >= LIMIAR_INTERLOCK && *duty_vt >= LIMIAR_INTERLOCK) {
+        *duty_aq = 0;
+        return true;
+    }
+    return false;
+}
+
 // ==========================================================================
 // ISR do timer (250 ms): so heartbeat + flag de amostragem
 // ==========================================================================
@@ -222,6 +232,7 @@ static float ler_umidade(void) {
 // Teste de atuadores (precisa de TEST ON; suspende o controle automatico):
 //   TEST ON | TEST OFF
 //   AQ <0-100> | VT <0-100> | UM <0-100> | BZ <0|1> | SWEEP
+//   INTERLOCK  -> forca AQ=VT=100% e dispara o intertravamento (buzzer)
 // ==========================================================================
 static void uart_envia(const char *s) {
     uart_write_blocking(UART_ID, (const uint8_t *)s, strlen(s));
@@ -301,6 +312,21 @@ static void processar_comando(const char *cmd) {
     if (strcmp(cmd, "SWEEP") == 0) {
         if (!modo_teste) { responder("ERRO ENVIE TEST ON ANTES\r\n"); return; }
         sweep_atuadores();
+        return;
+    }
+    if (strcmp(cmd, "INTERLOCK") == 0) {
+        if (!modo_teste) { responder("ERRO ENVIE TEST ON ANTES\r\n"); return; }
+        // Forca a condicao perigosa (AQ e VT no maximo) e aplica a MESMA
+        // logica de seguranca da operacao real: zera o aquecedor + alarme.
+        int aq = 100, vt = 100;
+        bool alarme = aplicar_interlock(&aq, &vt);
+        pwm_set_duty(PINO_AQUECEDOR, aq);
+        pwm_set_duty(PINO_VENTILADOR, vt);
+        gpio_put(PINO_BUZZER, alarme ? 1 : 0);
+        snprintf(resp, sizeof(resp),
+                 "OK INTERLOCK forcado: AQ=100 VT=100 -> AQ=%d VT=%d BUZZER=%d%s\r\n",
+                 aq, vt, alarme ? 1 : 0, alarme ? " ALARME" : "");
+        responder(resp);
         return;
     }
     if (sscanf(cmd, "AQ %d", &v) == 1) {
@@ -459,11 +485,7 @@ static void ciclo_controle(void) {
 
     // Intertravamento de seguranca (sempre ativo, nos dois modos):
     // aquecedor e ventilador nunca ambos no maximo.
-    bool alarme = false;
-    if (duty_aq >= LIMIAR_INTERLOCK && duty_vt >= LIMIAR_INTERLOCK) {
-        duty_aq = 0;
-        alarme = true;
-    }
+    bool alarme = aplicar_interlock(&duty_aq, &duty_vt);
 
     // Aplica aos atuadores.
     pwm_set_duty(PINO_AQUECEDOR, duty_aq);
@@ -519,7 +541,7 @@ int main(void) {
     printf("Comandos (UART fisica OU USB):\n");
     printf("  MODO AUTO | MODO MAN\n");
     printf("  SET TEMP <v> | SET UMID <v>   (so no modo MANUAL)\n");
-    printf("  TEST ON | TEST OFF | SWEEP\n");
+    printf("  TEST ON | TEST OFF | SWEEP | INTERLOCK\n");
     printf("  AQ <0-100> | VT <0-100> | UM <0-100> | BZ <0|1>\n");
     printf("===========================================================\n\n");
 
