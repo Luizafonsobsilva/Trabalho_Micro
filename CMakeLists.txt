@@ -43,6 +43,7 @@ target_link_libraries(teste_ap3
     hardware_clocks
     hardware_adc
     hardware_uart
+    hardware_i2c          # LCD 16x2 via backpack PCF8574
 )
 pico_enable_stdio_usb(teste_ap3 1)
 pico_enable_stdio_uart(teste_ap3 0)

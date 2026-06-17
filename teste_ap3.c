@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"   // LED onboard do Pico 2 W (via chip CYW43)
 #include "hardware/pwm.h"
@@ -36,6 +37,7 @@
 #include "hardware/clocks.h"
 #include "hardware/adc.h"
 #include "hardware/uart.h"
+#include "hardware/i2c.h"      // LCD 16x2 via backpack PCF8574
 
 // ==========================================================================
 // Mapa de pinos
@@ -156,6 +158,96 @@ static void pwm_set_duty(uint gpio, int duty_pct) {
     uint16_t wrap = pwm_hw->slice[slice].top;   // valor de wrap configurado
     uint32_t nivel = ((uint32_t)wrap + 1) * (uint32_t)duty_pct / 100;
     pwm_set_gpio_level(gpio, (uint16_t)nivel);
+}
+
+// ==========================================================================
+// LCD 16x2 (HD44780) via backpack I2C PCF8574
+// 4 fios: VCC(3V3), GND, SDA=GP4, SCL=GP5. Endereco detectado no boot.
+// Mapa do PCF8574: P0=RS P1=RW P2=EN P3=Backlight P4..P7=D4..D7
+// ==========================================================================
+#define LCD_I2C   i2c0
+#define PINO_SDA  4
+#define PINO_SCL  5
+#define LCD_BL    0x08   // backlight ligado
+#define LCD_EN    0x04   // enable
+#define LCD_RS    0x01   // 1=dado, 0=comando
+
+static bool    lcd_ok   = false;
+static uint8_t lcd_addr = 0x27;
+
+static void lcd_raw(uint8_t b) {
+    i2c_write_blocking(LCD_I2C, lcd_addr, &b, 1, false);
+}
+
+static void lcd_pulse(uint8_t data) {
+    lcd_raw(data | LCD_EN | LCD_BL);
+    sleep_us(1);
+    lcd_raw((data & ~LCD_EN) | LCD_BL);
+    sleep_us(50);
+}
+
+static void lcd_send(uint8_t val, uint8_t mode) {
+    lcd_pulse((val & 0xF0) | mode);          // nibble alto
+    lcd_pulse(((val << 4) & 0xF0) | mode);   // nibble baixo
+}
+
+static void lcd_cmd(uint8_t c)  { lcd_send(c, 0); }
+static void lcd_data(uint8_t d) { lcd_send(d, LCD_RS); }
+
+static void lcd_set_cursor(int linha, int col) {
+    static const uint8_t base[2] = { 0x00, 0x40 };
+    lcd_cmd(0x80 | (base[linha & 1] + col));
+}
+
+// Escreve uma linha inteira (16 chars, completando com espacos para limpar
+// o que sobrou da leitura anterior). printf-like.
+static void lcd_linha(int linha, const char *fmt, ...) {
+    if (!lcd_ok) return;
+    char buf[17];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) n = 0;
+    for (int i = n; i < 16; i++) buf[i] = ' ';
+    buf[16] = '\0';
+    lcd_set_cursor(linha, 0);
+    for (const char *p = buf; *p; p++) lcd_data((uint8_t)*p);
+}
+
+// Varre o barramento e devolve o 1o endereco que responde (0 = nenhum).
+static uint8_t i2c_buscar(void) {
+    for (uint8_t a = 0x08; a < 0x78; a++) {
+        uint8_t z = 0;
+        if (i2c_write_blocking(LCD_I2C, a, &z, 1, false) >= 0) return a;
+    }
+    return 0;
+}
+
+// Inicializa I2C + LCD. Retorna false se nenhum backpack respondeu.
+static bool init_lcd(void) {
+    i2c_init(LCD_I2C, 100 * 1000);
+    gpio_set_function(PINO_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(PINO_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(PINO_SDA);
+    gpio_pull_up(PINO_SCL);
+
+    uint8_t a = i2c_buscar();
+    if (a == 0) return false;
+    lcd_addr = a;
+
+    sleep_ms(50);                       // sequencia de init em 4 bits do HD44780
+    lcd_pulse(0x30); sleep_ms(5);
+    lcd_pulse(0x30); sleep_us(150);
+    lcd_pulse(0x30); sleep_us(150);
+    lcd_pulse(0x20); sleep_us(150);     // passa para 4 bits
+    lcd_cmd(0x28);   // 4 bits, 2 linhas, fonte 5x8
+    lcd_cmd(0x0C);   // display on, cursor off
+    lcd_cmd(0x06);   // incrementa o cursor a cada caractere
+    lcd_cmd(0x01);   // limpa
+    sleep_ms(2);
+
+    lcd_ok = true;
+    return true;
 }
 
 // Desliga todos os atuadores (sistema OFF ou seguranca).
@@ -510,6 +602,14 @@ static void ciclo_controle(void) {
            nome_modo, temp, setpoint_temp, umid, setpoint_umid,
            duty_aq, duty_vt, duty_um,
            alarme ? "  *** ALARME ***" : "");
+
+    // LCD 16x2: temperatura e umidade, atual > alvo.
+    lcd_linha(0, "T%5.1f>%5.1fC", temp, setpoint_temp);
+    if (alarme) {
+        lcd_linha(1, "U%5.1f>%5.1f ALM", umid, setpoint_umid);
+    } else {
+        lcd_linha(1, "U%5.1f>%5.1f %%", umid, setpoint_umid);
+    }
 }
 
 // ==========================================================================
@@ -524,6 +624,7 @@ int main(void) {
     init_adc();
     init_uart();
     init_botoes();
+    bool lcd_found = init_lcd();
 
     atuadores_off();
 
@@ -537,6 +638,8 @@ int main(void) {
     // Banner/ajuda na USB-CDC (debug). Os mesmos comandos valem pela UART.
     printf("\n=== AP3 - BRUCUTU =========================================\n");
     printf("Heartbeat (LED onboard): %s\n", hb_ok ? "ok" : "FALHOU cyw43");
+    if (lcd_found) printf("LCD I2C: ok no endereco 0x%02X (GP4=SDA GP5=SCL)\n", lcd_addr);
+    else           printf("LCD I2C: NAO encontrado (cheque fiacao/alimentacao)\n");
     printf("Botoes: POWER=GP14 (liga/desliga)  MODO=GP13 (AUTO/MANUAL)\n");
     printf("Comandos (UART fisica OU USB):\n");
     printf("  MODO AUTO | MODO MAN\n");
@@ -544,6 +647,10 @@ int main(void) {
     printf("  TEST ON | TEST OFF | SWEEP | INTERLOCK\n");
     printf("  AQ <0-100> | VT <0-100> | UM <0-100> | BZ <0|1>\n");
     printf("===========================================================\n\n");
+
+    // Splash no LCD.
+    lcd_linha(0, "AP3 - BRUCUTU");
+    lcd_linha(1, "Aperte POWER");
 
     bool estava_ligado = false;
 
@@ -574,6 +681,8 @@ int main(void) {
                     atuadores_off();
                     uart_envia("STATUS SISTEMA DESLIGADO\r\n");
                     printf("[OFF] sistema desligado\n");
+                    lcd_linha(0, "SISTEMA");
+                    lcd_linha(1, "DESLIGADO");
                     estava_ligado = false;
                 }
             }
