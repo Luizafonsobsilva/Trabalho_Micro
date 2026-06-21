@@ -1,11 +1,10 @@
-# BRUCUTU Sistemas Eletronicos S.A. — Controle de Clima (AP3)
+# BRUCUTU Sistemas Eletronicos S.A. — Controle de Clima (P2)
 
 Projeto da disciplina de Sistemas Embarcados. Firmware em C, com o **Pico SDK**,
 para um **Raspberry Pi Pico 2W (RP2350)** rodando em modo **RISC-V (nucleos
 Hazard3)**.
 
-A entrega anterior (AP2) cobriu apenas **ADC** e **UART**. Esta entrega (AP3)
-amplia o sistema com **PWM**, **Timer / Timer Interrupt** e **Interrupcao
+Esta entrega (P2) amplia o sistema com **PWM**, **Timer / Timer Interrupt** e **Interrupcao
 Externa**, mantendo ADC e UART como entradas/saidas de apoio. O codigo de
 referencia desta entrega esta em [`Codigo_P2.c`](./Codigo_P2.c).
 
@@ -100,14 +99,9 @@ Ambiente:
 Fluxo:
 
 1. `Raspberry Pi Pico: Configure CMake`
-2. Selecionar o alvo (`teste_ap3`, `teste_integrado`, `teste_adc` ou `teste_uart`) e Compile.
+2. Selecionar o alvo (`Codigo_P2.c`) e Compile.
 3. Pico em modo **BOOTSEL** → Flash, ou arrastar manualmente o `.uf2` de
    `build/` para a unidade `RPI-RP2`.
-
-Alvos definidos em `CMakeLists.txt`:
-
-- `teste_ap3` — firmware principal (codigo deste repositorio).
-- `teste_integrado`, `teste_adc`, `teste_uart` — alvos de apoio / fallback da AP2.
 
 ## Protocolo de comandos (UART e USB)
 
@@ -150,15 +144,6 @@ T 24.3> 25.0C
 U 42.7> 50.0 %     (ou "ALM" no lugar de "%" em alarme)
 ```
 
-## Notas de hardware aprendidas
-
-- IRF520/IRF540N **nao** saturam com 3,3 V de GPIO. Usar MOSFETs de
-  **nivel-logico**: **IRLZ44N**, IRLB8721 ou IRL520.
-- Tacometro de ventilador (entregas futuras): pull-up para **3,3 V**, nunca
-  5 V, para nao danificar o GPIO.
-- **Wokwi** so simula RP2040 — da para usar como stand-in para
-  ADC/UART/PWM/I2C (API do SDK compativel), mas nao testa o RP2350 em si.
-
 ## Regras de ISR (resumo)
 
 - ISR **curta**: so flag/contador/toggle. ADC, UART, PWM e `printf` ficam no main.
@@ -174,6 +159,5 @@ Trabalho_Micro/
 ├── CMakeLists.txt         # alvos teste_ap3, teste_integrado, teste_adc, teste_uart
 ├── pico_sdk_import.cmake  # gerado pela extensao do Pico SDK
 ├── Codigo_P2.c            # firmware principal (AP3)
-├── CLAUDE.md              # contexto interno do projeto
 └── README.md              # este arquivo
 ```
